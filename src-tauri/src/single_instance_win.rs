@@ -3,6 +3,15 @@
 //! Derived from `tauri-plugin-single-instance` (Apache-2.0 / MIT), replacing
 //! blocking `SendMessageW` with `SendMessageTimeoutW(SMTO_ABORTIFHUNG)` and
 //! taking over when the primary is hung so relaunch does not leave zombie processes.
+//!
+//! ## Zombie primary (WndProc alive, main loop dead)
+//!
+//! A stuck primary can still answer `SendMessage` on the SI window while its
+//! Tauri main thread no longer runs — global shortcuts and tray clicks die, but
+//! secondary launches used to exit after a successful notify. We therefore also
+//! require a **main-thread ACK** on a named event before treating the primary as
+//! healthy. ACK is signaled only from `run_on_main_thread`; if it never arrives,
+//! the secondary takes over.
 
 #![cfg(target_os = "windows")]
 
@@ -25,9 +34,10 @@ use windows_sys::Win32::{
         DataExchange::COPYDATASTRUCT,
         LibraryLoader::GetModuleHandleW,
         Threading::{
-            CreateMutexW, OpenProcess, QueryFullProcessImageNameW, ReleaseMutex, TerminateProcess,
-            WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
-            PROCESS_TERMINATE,
+            CreateEventW, CreateMutexW, OpenEventW, OpenProcess, QueryFullProcessImageNameW,
+            ReleaseMutex, ResetEvent, SetEvent, TerminateProcess, WaitForSingleObject,
+            EVENT_MODIFY_STATE, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+            PROCESS_TERMINATE, SYNCHRONIZATION_SYNCHRONIZE,
         },
     },
     UI::WindowsAndMessaging::{
@@ -40,9 +50,13 @@ use windows_sys::Win32::{
 };
 
 const WMCOPYDATA_SINGLE_INSTANCE_DATA: usize = 1542;
-/// Max wait for a healthy primary to handle the second-instance notify.
-/// Longer than a typical busy UI stretch so we do not false-takeover a slow-but-alive primary.
+/// Max wait for a healthy primary's SI WndProc to accept the notify.
 const NOTIFY_TIMEOUT_MS: u32 = 5000;
+/// Max wait for the primary **main thread** to ACK after WndProc queued work.
+/// ACK is signaled before `on_second_instance` work; this covers main-queue delay only.
+const MAIN_ACK_TIMEOUT_MS: u32 = 5000;
+/// Max wait for the secondary-notify gate (serializes ResetEvent + Wait ACK).
+const NOTIFY_GATE_TIMEOUT_MS: u32 = 8000;
 /// Max wait to own the mutex after terminating a hung primary.
 const MUTEX_ACQUIRE_TIMEOUT_MS: u32 = 8000;
 
@@ -50,10 +64,12 @@ type SingleInstanceCallback<R> = dyn FnMut(&AppHandle<R>, Vec<String>, String) +
 
 struct MutexHandle(isize);
 struct TargetWindowHandle(isize);
+struct AckEventHandle(isize);
 
 struct UserData<R: Runtime> {
     app: AppHandle<R>,
     callback: Arc<Mutex<Box<SingleInstanceCallback<R>>>>,
+    ack_event: isize,
 }
 
 impl<R: Runtime> UserData<R> {
@@ -68,18 +84,43 @@ impl<R: Runtime> UserData<R> {
     /// Queue the callback off the SI window procedure so `SendMessageTimeout` can
     /// return and Tauri window ops are not nested inside the WndProc (avoids
     /// reentrancy deadlocks when the primary is healthy).
+    ///
+    /// Signals the ACK event from the main thread **before** user work so a busy
+    /// `on_second_instance` does not cause false takeover.
     fn run_callback_deferred(&self, args: Vec<String>, cwd: String) {
         let app = self.app.clone();
         let callback = Arc::clone(&self.callback);
+        // isize is Send; raw HANDLE (*mut c_void) is not.
+        let ack = self.ack_event;
         std::thread::spawn(move || {
             let app_for_main = app.clone();
-            let _ = app.run_on_main_thread(move || {
+            let queued = app.run_on_main_thread(move || {
+                if ack != 0 {
+                    unsafe {
+                        SetEvent(ack as HANDLE);
+                    }
+                }
                 if let Ok(mut guard) = callback.lock() {
                     (guard)(&app_for_main, args, cwd);
                 }
             });
+            if queued.is_err() {
+                warn!("single-instance: run_on_main_thread failed; ACK will not be signaled");
+            }
         });
     }
+}
+
+/// Whether the secondary should exit because the primary is considered alive.
+///
+/// - `wndproc_ok`: SI window accepted `SendMessageTimeout`.
+/// - `main_ack`: `Some(true/false)` when an ACK event exists; `None` means the
+///   event is missing (treat as unhealthy — cannot verify main-thread liveness).
+fn secondary_should_exit(wndproc_ok: bool, main_ack: Option<bool>) -> bool {
+    if !wndproc_ok {
+        return false;
+    }
+    main_ack.unwrap_or(false)
 }
 
 /// Install MarkerOn's Windows single-instance behaviour.
@@ -96,6 +137,10 @@ where
             let class_name = encode_wide(format!("{id}-sic"));
             let window_name = encode_wide(format!("{id}-siw"));
             let mutex_name = encode_wide(format!("{id}-sim"));
+            let ack_name = encode_wide(format!("{id}-sia"));
+            // Serializes secondary notify so concurrent ResetEvent cannot clear another
+            // secondary's ACK (false takeover of a healthy primary).
+            let gate_name = encode_wide(format!("{id}-sin"));
 
             let hmutex =
                 unsafe { CreateMutexW(std::ptr::null(), 1i32, mutex_name.as_ptr()) };
@@ -113,7 +158,7 @@ where
                 let hwnd = unsafe { FindWindowW(class_name.as_ptr(), window_name.as_ptr()) };
 
                 if !hwnd.is_null() {
-                    if notify_existing_instance(hwnd) {
+                    if notify_existing_instance(hwnd, &ack_name, &gate_name) {
                         unsafe {
                             CloseHandle(hmutex);
                         }
@@ -122,8 +167,7 @@ where
                     }
 
                     info!(
-                        "single-instance: primary did not respond within {}ms; taking over",
-                        NOTIFY_TIMEOUT_MS
+                        "single-instance: primary unresponsive (WndProc and/or main ACK); taking over"
                     );
                     terminate_si_owner_if_ours(hwnd);
                 } else {
@@ -145,11 +189,25 @@ where
                 }
             }
 
+            // Manual-reset ACK event: secondary ResetEvent → notify → Wait;
+            // primary SetEvent from main thread. Create before the SI window so a
+            // visible SI window always has a matching ACK channel on this build.
+            let hack = unsafe {
+                CreateEventW(std::ptr::null(), 1i32, 0i32, ack_name.as_ptr())
+            };
+            if hack.is_null() {
+                warn!("single-instance: CreateEventW(ACK) failed ({})", unsafe {
+                    GetLastError()
+                });
+            }
+
             app.manage(MutexHandle(hmutex as isize));
+            app.manage(AckEventHandle(hack as isize));
 
             let userdata = UserData {
                 app: app.clone(),
                 callback: Arc::clone(&callback),
+                ack_event: hack as isize,
             };
             let userdata = Box::into_raw(Box::new(userdata));
             let hwnd = create_event_target_window::<R>(&class_name, &window_name, userdata);
@@ -177,10 +235,62 @@ fn destroy<R: Runtime, M: Manager<R>>(manager: &M) {
             DestroyWindow(hwnd.0 as HWND);
         }
     }
+    if let Some(ack) = manager.try_state::<AckEventHandle>() {
+        if ack.0 != 0 {
+            unsafe {
+                CloseHandle(ack.0 as HANDLE);
+            }
+        }
+    }
 }
 
-/// Returns true when the primary acknowledged the notify (secondary should exit).
-fn notify_existing_instance(hwnd: HWND) -> bool {
+/// Returns true when the primary is alive (WndProc + main-thread ACK).
+fn notify_existing_instance(hwnd: HWND, ack_name: &[u16], gate_name: &[u16]) -> bool {
+    // Gate must wrap Reset→Send→Wait so two secondaries cannot interleave ResetEvent
+    // and clear each other's ACK.
+    let gate = unsafe { CreateMutexW(std::ptr::null(), 0i32, gate_name.as_ptr()) };
+    if gate.is_null() {
+        warn!(
+            "single-instance: CreateMutexW(notify gate) failed ({})",
+            unsafe { GetLastError() }
+        );
+        return false;
+    }
+    let gate_wait = unsafe { WaitForSingleObject(gate, NOTIFY_GATE_TIMEOUT_MS) };
+    if gate_wait != WAIT_OBJECT_0 && gate_wait != WAIT_ABANDONED {
+        warn!("single-instance: notify gate timed out ({gate_wait})");
+        unsafe {
+            CloseHandle(gate);
+        }
+        return false;
+    }
+
+    let alive = notify_existing_instance_locked(hwnd, ack_name);
+
+    unsafe {
+        ReleaseMutex(gate);
+        CloseHandle(gate);
+    }
+    alive
+}
+
+fn notify_existing_instance_locked(hwnd: HWND, ack_name: &[u16]) -> bool {
+    let access = EVENT_MODIFY_STATE | SYNCHRONIZATION_SYNCHRONIZE;
+    let hack = unsafe { OpenEventW(access, 0, ack_name.as_ptr()) };
+    if hack.is_null() {
+        // Cannot verify main-thread liveness (old build or broken primary).
+        // WndProc-only success is not enough — that is exactly the zombie case.
+        warn!(
+            "single-instance: ACK event missing (err {}); treating primary as unhealthy",
+            unsafe { GetLastError() }
+        );
+        return secondary_should_exit(true, None);
+    }
+
+    unsafe {
+        ResetEvent(hack);
+    }
+
     let cwd = std::env::current_dir().unwrap_or_default();
     let cwd = cwd.to_str().unwrap_or_default();
     let args = std::env::args().collect::<Vec<String>>().join("|");
@@ -193,7 +303,7 @@ fn notify_existing_instance(hwnd: HWND) -> bool {
     };
 
     let mut result: usize = 0;
-    let ok = unsafe {
+    let wndproc_ok = unsafe {
         SendMessageTimeoutW(
             hwnd,
             WM_COPYDATA,
@@ -203,8 +313,28 @@ fn notify_existing_instance(hwnd: HWND) -> bool {
             NOTIFY_TIMEOUT_MS,
             &mut result,
         )
-    };
-    ok != 0
+    } != 0;
+
+    if !wndproc_ok {
+        unsafe {
+            CloseHandle(hack);
+        }
+        return secondary_should_exit(false, Some(false));
+    }
+
+    let wait = unsafe { WaitForSingleObject(hack, MAIN_ACK_TIMEOUT_MS) };
+    unsafe {
+        CloseHandle(hack);
+    }
+
+    let acked = wait == WAIT_OBJECT_0;
+    if !acked {
+        warn!(
+            "single-instance: main-thread ACK timed out after {}ms (zombie primary?)",
+            MAIN_ACK_TIMEOUT_MS
+        );
+    }
+    secondary_should_exit(true, Some(acked))
 }
 
 fn terminate_si_owner_if_ours(hwnd: HWND) {
@@ -245,7 +375,7 @@ fn terminate_si_owner_if_ours(hwnd: HWND) {
         return;
     }
 
-    info!("single-instance: terminating hung primary pid {pid}");
+    info!("single-instance: terminating hung/zombie primary pid {pid}");
     let terminated = unsafe { TerminateProcess(handle, 1) };
     if terminated == 0 {
         warn!(
@@ -397,4 +527,31 @@ unsafe fn GetWindowLongPtrW(hwnd: HWND, index: WINDOW_LONG_PTR_INDEX) -> isize {
 #[allow(non_snake_case)]
 unsafe fn GetWindowLongPtrW(hwnd: HWND, index: WINDOW_LONG_PTR_INDEX) -> isize {
     w32wm::GetWindowLongPtrW(hwnd, index)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::secondary_should_exit;
+
+    #[test]
+    fn exit_when_wndproc_and_main_ack() {
+        assert!(secondary_should_exit(true, Some(true)));
+    }
+
+    #[test]
+    fn takeover_when_wndproc_hung() {
+        assert!(!secondary_should_exit(false, Some(true)));
+        assert!(!secondary_should_exit(false, None));
+    }
+
+    #[test]
+    fn takeover_when_main_ack_times_out() {
+        // Zombie: SI WndProc answers SendMessage, main loop never ACKs.
+        assert!(!secondary_should_exit(true, Some(false)));
+    }
+
+    #[test]
+    fn takeover_when_ack_event_missing() {
+        assert!(!secondary_should_exit(true, None));
+    }
 }

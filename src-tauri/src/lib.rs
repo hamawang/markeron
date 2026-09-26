@@ -97,7 +97,11 @@ fn focus_settings_window(app: &AppHandle, tab: Option<&str>) {
 /// Previously this only focused the settings window, which no-ops when settings
 /// was never opened — so relaunch appeared to do nothing. `toggle_drawing` is the
 /// same path as the tray and global shortcut; safe on macOS Accessory policy.
+///
+/// Also re-binds global shortcuts so a relaunch can heal OS hotkeys lost after
+/// sleep/session changes while the process is otherwise still alive.
 fn on_second_instance(app: &AppHandle) {
+    shortcuts::register_shortcuts(app);
     let state = app.state::<AppState>();
     log_backend_event(
         &state,

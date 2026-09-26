@@ -38,7 +38,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 # Same GCD queue tao uses for setLevel / ignoresMouseEvents — keep toolbar restack ordered after those.
 dispatch2 = "0.3"
-# Official plugin on macOS; Windows uses `single_instance_win` (hang-safe takeover).
+# Official plugin on macOS; Windows uses `single_instance_win` (hang/zombie-safe takeover).
 tauri-plugin-single-instance = "2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
