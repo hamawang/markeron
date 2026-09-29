@@ -64,10 +64,11 @@ function setup() {
 }
 
 // Mock requestAnimationFrame / cancelAnimationFrame for render scheduling
-vi.stubGlobal('requestAnimationFrame', (cb: () => void) => {
+const syncRequestAnimationFrame = (cb: () => void) => {
   cb()
   return 1
-})
+}
+vi.stubGlobal('requestAnimationFrame', syncRequestAnimationFrame)
 vi.stubGlobal('cancelAnimationFrame', vi.fn())
 vi.stubGlobal(
   'document',
@@ -811,6 +812,88 @@ describe('useDrawing', () => {
       drawing.redrawAll()
 
       expect(ctx.setTransform).toHaveBeenCalledWith(1.5, 0, 0, 1.5, 0, 0)
+    })
+  })
+
+  describe('live ink preview', () => {
+    let frames: (() => void)[] = []
+    let nextFrameId = 1
+
+    function wave(i: number) {
+      return { x: 20 + i * 3, y: 300 + Math.sin(i / 9) * 120, pressure: 0.5 }
+    }
+
+    /** One pointer sample per animation frame, like a real stroke. */
+    function drawFrame(p: { x: number; y: number; pressure: number }) {
+      drawing.draw(p)
+      const pending = frames
+      frames = []
+      for (const cb of pending) cb()
+    }
+
+    beforeEach(() => {
+      frames = []
+      vi.stubGlobal('requestAnimationFrame', (cb: () => void) => {
+        frames.push(cb)
+        return nextFrameId++
+      })
+    })
+
+    afterEach(() => {
+      vi.stubGlobal('requestAnimationFrame', syncRequestAnimationFrame)
+      vi.restoreAllMocks()
+    })
+
+    it('keeps per-sample outline work bounded on long strokes', () => {
+      drawing.currentTool.value = 'pen'
+      drawing.startDraw({ ...wave(0), pointerType: 'pen' })
+      for (let i = 1; i < 1600; i++) drawFrame(wave(i))
+      expect(drawing.getActiveStrokePointCount()).toBe(1600)
+
+      const curves = vi.spyOn(Path2D.prototype, 'quadraticCurveTo')
+      drawFrame(wave(1600))
+      // A full re-outline of 1600 points emits thousands of curve segments.
+      expect(curves.mock.calls.length).toBeGreaterThan(0)
+      expect(curves.mock.calls.length).toBeLessThan(800)
+
+      const ctx = previewCanvas.getContext('2d') as unknown as { drawImage: ReturnType<typeof vi.fn> }
+      expect(ctx.drawImage).toHaveBeenCalled()
+
+      drawing.endDraw()
+      expect(drawing.canUndo.value).toBe(true)
+    })
+
+    it('composites long highlighter strokes at the stroke opacity', () => {
+      drawing.currentTool.value = 'highlighter'
+      drawing.startDraw({ ...wave(0), pointerType: 'mouse' })
+      const ctx = previewCanvas.getContext('2d') as unknown as {
+        drawImage: ReturnType<typeof vi.fn>
+        globalAlpha: number
+      }
+      const alphas: number[] = []
+      ctx.drawImage.mockImplementation(() => {
+        alphas.push(ctx.globalAlpha)
+      })
+      for (let i = 1; i < 800; i++) drawFrame(wave(i))
+
+      expect(alphas.length).toBeGreaterThan(0)
+      expect(alphas.every((a) => a === 0.35)).toBe(true)
+      drawing.endDraw()
+      expect(drawing.canUndo.value).toBe(true)
+    })
+
+    it('rebuilds the live preview when width changes mid-stroke', () => {
+      drawing.currentTool.value = 'pen'
+      drawing.lineWidth.value = 3
+      drawing.startDraw({ ...wave(0), pointerType: 'mouse' })
+      for (let i = 1; i < 600; i++) drawFrame(wave(i))
+      drawing.lineWidth.value = 8
+      const curves = vi.spyOn(Path2D.prototype, 'quadraticCurveTo')
+      drawFrame(wave(600))
+      // Restart re-freezes the whole prefix once at the new width.
+      expect(curves.mock.calls.length).toBeGreaterThan(800)
+      drawing.endDraw()
+      expect(drawing.canUndo.value).toBe(true)
     })
   })
 })

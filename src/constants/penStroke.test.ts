@@ -1,7 +1,16 @@
 import { describe, expect, it } from 'vitest'
+import { getStrokePoints } from 'perfect-freehand'
 import {
   computeMinDistSq,
   getInkOutline,
+  getInkOutlineFromStrokePoints,
+  inkChunkOverlapLength,
+  inkFreehandOptions,
+  InkStrokePointStream,
+  INK_FREEZE_MIN_POINTS,
+  INK_LIVE_TAIL_POINTS,
+  planInkFreeze,
+  type FreehandInputPoint,
   normalizePressure,
   outlineToPath2D,
   penStrokeStyle,
@@ -109,5 +118,112 @@ describe('getInkOutline / outlineToPath2D', () => {
     expect(mouse.length).toBeGreaterThan(3)
     expect(pen.length).toBeGreaterThan(3)
     expect(pen).not.toEqual(mouse)
+  })
+})
+
+/** Deterministic wobbly walk with repeats, stalls and pressure changes. */
+function randomInputs(count: number, seed: number): FreehandInputPoint[] {
+  let s = seed
+  const rand = () => {
+    s = (s * 1664525 + 1013904223) % 4294967296
+    return s / 4294967296
+  }
+  const out: FreehandInputPoint[] = []
+  let x = 100
+  let y = 100
+  let angle = 0
+  for (let i = 0; i < count; i++) {
+    const r = rand()
+    if (r < 0.08 && out.length > 0) {
+      out.push([...out[out.length - 1]] as FreehandInputPoint)
+      continue
+    }
+    angle += (rand() - 0.5) * 1.2
+    const step = r < 0.15 ? rand() * 0.3 : 0.5 + rand() * 12
+    x += Math.cos(angle) * step
+    y += Math.sin(angle) * step
+    out.push([x, y, 0.05 + rand() * 0.95])
+  }
+  return out
+}
+
+describe('InkStrokePointStream', () => {
+  it('matches perfect-freehand getStrokePoints for every prefix', () => {
+    for (const level of ['off', 'standard', 'strong'] as const) {
+      for (const size of [1, 3, 12, 40]) {
+        const options = inkFreehandOptions(size, level, false, 'pen')
+        const inputs = randomInputs(160, size * 31 + level.length)
+        const stream = new InkStrokePointStream(options)
+        for (let n = 1; n <= inputs.length; n++) {
+          stream.append(inputs[n - 1])
+          expect(stream.slice(0)).toEqual(getStrokePoints(inputs.slice(0, n), options))
+        }
+      }
+    }
+  })
+
+  it('never rewrites settled points', () => {
+    const options = inkFreehandOptions(6, 'standard', false, 'mouse')
+    const inputs = randomInputs(300, 7)
+    const stream = new InkStrokePointStream(options)
+    const snapshots: unknown[] = []
+    for (const input of inputs) {
+      stream.append(input)
+      for (let i = snapshots.length; i < stream.settledCount; i++) {
+        snapshots.push(structuredClone(stream.settledAt(i)))
+      }
+    }
+    for (let i = 1; i < snapshots.length; i++) {
+      expect(stream.settledAt(i)).toEqual(snapshots[i])
+    }
+  })
+
+  it('slices from a later index without the head-vector fixup', () => {
+    const options = inkFreehandOptions(4, 'standard', false, 'mouse')
+    const stream = new InkStrokePointStream(options)
+    for (const input of randomInputs(80, 3)) stream.append(input)
+    const full = stream.slice(0)
+    const tail = stream.slice(10)
+    expect(tail).toEqual(full.slice(10))
+    expect(getInkOutlineFromStrokePoints(tail, options).length).toBeGreaterThan(3)
+    expect(getInkOutlineFromStrokePoints([], options)).toEqual([])
+  })
+})
+
+describe('planInkFreeze', () => {
+  function streamOf(count: number, size: number) {
+    const stream = new InkStrokePointStream(inkFreehandOptions(size, 'standard', false, 'mouse'))
+    for (let i = 0; i < count; i++) stream.append([i * 3, Math.sin(i / 5) * 20, 0.5])
+    return stream
+  }
+
+  it('waits until enough settled points sit behind the live tail', () => {
+    const size = 4
+    const needed = INK_FREEZE_MIN_POINTS + INK_LIVE_TAIL_POINTS + 1
+    expect(planInkFreeze(streamOf(needed - 10, size), 0, size)).toBeNull()
+    expect(planInkFreeze(streamOf(needed + 20, size), 0, size)).not.toBeNull()
+  })
+
+  it('restarts the tail far enough back to cover chunk caps', () => {
+    const size = 8
+    const stream = streamOf(400, size)
+    const plan = planInkFreeze(stream, 0, size)!
+    expect(plan.end).toBe(stream.settledCount - 1 - INK_LIVE_TAIL_POINTS)
+    expect(plan.nextStart).toBeGreaterThan(0)
+    expect(plan.nextStart).toBeLessThan(plan.end)
+    const overlap = stream.settledAt(plan.end).runningLength - stream.settledAt(plan.nextStart).runningLength
+    expect(overlap).toBeGreaterThanOrEqual(inkChunkOverlapLength(size))
+  })
+
+  it('refuses to freeze when the chunk is shorter than the required overlap', () => {
+    const size = 20
+    const stream = new InkStrokePointStream(inkFreehandOptions(size, 'off', false, 'mouse'))
+    for (let i = 0; i < 400; i++) stream.append([i < 5 ? i * 10 : 40 + i * 0.05, 0, 0.5])
+    const end = stream.settledCount - 1 - INK_LIVE_TAIL_POINTS
+    expect(end).toBeGreaterThan(INK_FREEZE_MIN_POINTS)
+    expect(stream.settledAt(end).runningLength - stream.settledAt(1).runningLength).toBeLessThan(
+      inkChunkOverlapLength(size),
+    )
+    expect(planInkFreeze(stream, 0, size)).toBeNull()
   })
 })

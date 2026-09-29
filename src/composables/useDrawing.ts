@@ -10,11 +10,21 @@ import {
   hitTestAction,
   snapPointToAngle,
 } from './drawingGeometry'
-import { drawActionDirect, drawInkStroke, drawLaserTrail } from './drawingRender'
+import { drawActionDirect, drawLaserTrail } from './drawingRender'
 import { normalizeTextOutline } from '../constants/textOutline'
 import { stampFontSizeFromWidth } from '../constants/stamp'
 import { isLaserTrailGone, pruneAgedLaserPoints } from '../constants/laser'
-import { computeMinDistSq, normalizePressure, penStrokeStyle, smoothPenPoint } from '../constants/penStroke'
+import {
+  computeMinDistSq,
+  getInkOutlineFromStrokePoints,
+  inkFreehandOptions,
+  InkStrokePointStream,
+  normalizePressure,
+  outlineToPath2D,
+  penStrokeStyle,
+  planInkFreeze,
+  smoothPenPoint,
+} from '../constants/penStroke'
 import { getStrokeSmoothing } from './strokeSmoothingState'
 
 export type { Tool, Point, DrawAction } from './drawingTypes'
@@ -319,9 +329,20 @@ export function useDrawing(
   let historyDirty = true
   let previewDirty = true
 
-  // Live ink preview buffer (full-stroke redraw; avoids bake/join artifacts with variable width).
+  // Live ink preview: settled stroke points are rasterized once into strokeCanvas as
+  // overlapping chunks at full opacity; only the tail behind the tip is re-outlined per
+  // frame, so cost stays flat as the stroke grows. Opacity is applied when compositing.
   let strokeCanvas: HTMLCanvasElement | null = null
   let strokeCtx: CanvasRenderingContext2D | null = null
+  let inkComposeCanvas: HTMLCanvasElement | null = null
+  let inkComposeCtx: CanvasRenderingContext2D | null = null
+  let inkLiveAction: DrawAction | null = null
+  let inkLiveKey = ''
+  let inkStream: InkStrokePointStream | null = null
+  let inkFedPoints = 0
+  let inkChunkStart = 0
+  let inkHasFrozen = false
+  let inkTailPath: Path2D | null = null
 
   // Pre-rendered drag element canvas (avoids per-frame path reconstruction)
   let dragCanvas: HTMLCanvasElement | null = null
@@ -559,10 +580,13 @@ export function useDrawing(
     const canvas = previewCanvasRef.value
     if (!canvas) return
     if (!strokeCanvas) strokeCanvas = document.createElement('canvas')
-    strokeCanvas.width = canvas.width
-    strokeCanvas.height = canvas.height
-    strokeCtx = strokeCanvas.getContext('2d')
-    inkPreviewDirty = true
+    // Reassigning width/height reallocates the backing store even when unchanged.
+    if (!strokeCtx || strokeCanvas.width !== canvas.width || strokeCanvas.height !== canvas.height) {
+      strokeCanvas.width = canvas.width
+      strokeCanvas.height = canvas.height
+      strokeCtx = strokeCanvas.getContext('2d')
+    }
+    clearStrokeCanvas()
   }
 
   function clearStrokeCanvas() {
@@ -570,7 +594,29 @@ export function useDrawing(
       strokeCtx.setTransform(1, 0, 0, 1, 0, 0)
       strokeCtx.clearRect(0, 0, strokeCanvas.width, strokeCanvas.height)
     }
+    inkLiveAction = null
+    inkLiveKey = ''
+    inkStream = null
+    inkFedPoints = 0
+    inkChunkStart = 0
+    inkHasFrozen = false
+    inkTailPath = null
     inkPreviewDirty = true
+  }
+
+  function getInkComposeCtx(): CanvasRenderingContext2D | null {
+    if (!strokeCanvas) return null
+    if (!inkComposeCanvas) inkComposeCanvas = document.createElement('canvas')
+    if (
+      !inkComposeCtx ||
+      inkComposeCanvas.width !== strokeCanvas.width ||
+      inkComposeCanvas.height !== strokeCanvas.height
+    ) {
+      inkComposeCanvas.width = strokeCanvas.width
+      inkComposeCanvas.height = strokeCanvas.height
+      inkComposeCtx = inkComposeCanvas.getContext('2d')
+    }
+    return inkComposeCtx
   }
 
   function resolveActionBbox(action: DrawAction): DrawAction['bbox'] {
@@ -746,8 +792,9 @@ export function useDrawing(
   }
 
   /**
-   * Rasterize the full in-progress ink stroke into strokeCanvas (last:false for
-   * a live tip). Called when points change; preview just blit the buffer.
+   * Bring the live ink preview up to date (last:false for a live tip): freeze newly
+   * settled chunks into strokeCanvas and rebuild the tail path. Width / smoothing /
+   * DPR changes restart from the first point.
    */
   function bakeIncrementalStroke(action: DrawAction) {
     if (!strokeCtx || !strokeCanvas) return
@@ -756,14 +803,80 @@ export function useDrawing(
     if (pts.length === 0) return
 
     const dpr = getEffectiveDpr()
-    strokeCtx.setTransform(1, 0, 0, 1, 0, 0)
-    strokeCtx.clearRect(0, 0, strokeCanvas.width, strokeCanvas.height)
-    strokeCtx.setTransform(dpr, 0, 0, dpr, 0, 0)
-    strokeCtx.globalCompositeOperation = 'source-over'
-    strokeCtx.globalAlpha = action.opacity
-    strokeCtx.fillStyle = action.color
-    drawInkStroke(strokeCtx, pts, action.lineWidth, false, action.pointerType)
+    const level = getStrokeSmoothing()
+    const key = `${action.lineWidth}|${level}|${action.pointerType ?? ''}|${dpr}|${strokeCanvas.width}x${strokeCanvas.height}`
+    if (action !== inkLiveAction || key !== inkLiveKey || pts.length < inkFedPoints || !inkStream) {
+      clearStrokeCanvas()
+      inkLiveAction = action
+      inkLiveKey = key
+      inkStream = new InkStrokePointStream(inkFreehandOptions(action.lineWidth, level, false, action.pointerType))
+    }
+    const stream = inkStream
+    for (; inkFedPoints < pts.length; inkFedPoints++) {
+      const p = pts[inkFedPoints]
+      stream.append([p.x, p.y, normalizePressure(p.pressure)])
+    }
+
+    if (pts.length === 1) {
+      const path = new Path2D()
+      path.arc(pts[0].x, pts[0].y, Math.max(0.5, action.lineWidth / 2), 0, Math.PI * 2)
+      inkTailPath = path
+      inkPreviewDirty = false
+      return
+    }
+
+    const options = inkFreehandOptions(action.lineWidth, level, false, action.pointerType)
+    let plan = planInkFreeze(stream, inkChunkStart, action.lineWidth)
+    if (plan) {
+      strokeCtx.setTransform(dpr, 0, 0, dpr, 0, 0)
+      strokeCtx.globalCompositeOperation = 'source-over'
+      strokeCtx.globalAlpha = 1
+      strokeCtx.fillStyle = action.color
+    }
+    while (plan) {
+      const chunk = stream.slice(inkChunkStart, plan.end + 1)
+      strokeCtx.fill(outlineToPath2D(getInkOutlineFromStrokePoints(chunk, options)))
+      inkHasFrozen = true
+      inkChunkStart = plan.nextStart
+      plan = planInkFreeze(stream, inkChunkStart, action.lineWidth)
+    }
+
+    inkTailPath = outlineToPath2D(getInkOutlineFromStrokePoints(stream.slice(inkChunkStart), options))
     inkPreviewDirty = false
+  }
+
+  /** Frozen chunks + live tail. Overlaps are composited at full alpha so opacity stays uniform. */
+  function drawLiveInk(ctx: CanvasRenderingContext2D, action: DrawAction, dpr: number) {
+    if (!strokeCanvas || !inkTailPath) return
+    ctx.save()
+    ctx.globalCompositeOperation = 'source-over'
+    if (action.opacity >= 1 || !inkHasFrozen) {
+      if (inkHasFrozen) {
+        ctx.setTransform(1, 0, 0, 1, 0, 0)
+        ctx.globalAlpha = 1
+        ctx.drawImage(strokeCanvas, 0, 0)
+      }
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+      ctx.globalAlpha = action.opacity
+      ctx.fillStyle = action.color
+      ctx.fill(inkTailPath)
+    } else {
+      const compose = getInkComposeCtx()
+      if (compose && inkComposeCanvas) {
+        compose.setTransform(1, 0, 0, 1, 0, 0)
+        compose.globalCompositeOperation = 'source-over'
+        compose.globalAlpha = 1
+        compose.clearRect(0, 0, inkComposeCanvas.width, inkComposeCanvas.height)
+        compose.drawImage(strokeCanvas, 0, 0)
+        compose.setTransform(dpr, 0, 0, dpr, 0, 0)
+        compose.fillStyle = action.color
+        compose.fill(inkTailPath)
+        ctx.setTransform(1, 0, 0, 1, 0, 0)
+        ctx.globalAlpha = action.opacity
+        ctx.drawImage(inkComposeCanvas, 0, 0)
+      }
+    }
+    ctx.restore()
   }
 
   function renderHistoryFrame() {
@@ -827,7 +940,7 @@ export function useDrawing(
         drawLaserTrail(ctx, action.points, action.color, action.lineWidth, performance.now(), true)
       } else if (isInkTool(action.tool) && strokeCanvas) {
         if (inkPreviewDirty) bakeIncrementalStroke(action)
-        ctx.drawImage(strokeCanvas, 0, 0)
+        drawLiveInk(ctx, action, dpr)
       } else {
         ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
         drawActionOn(ctx, action)
@@ -966,8 +1079,10 @@ export function useDrawing(
       removedAny = true
     }
     objectEraserLastProcessedPt = pts.length
-    if (removedAny) markHistoryStacksChanged()
-    invalidateCache()
+    if (removedAny) {
+      markHistoryStacksChanged()
+      invalidateCache()
+    }
   }
 
   function startDraw(point: Point) {
@@ -1067,8 +1182,8 @@ export function useDrawing(
       if (action.tool === 'laser') {
         ensureLaserAnimation()
       } else if (isInkTool(action.tool)) {
+        // Rebuilt once per frame in renderPreviewFrame, not per pointer sample.
         inkPreviewDirty = true
-        bakeIncrementalStroke(action)
       } else if (action.tool === 'eraser' && eraserMode.value === 'object') {
         processObjectEraserHits(action)
       }
@@ -1723,6 +1838,11 @@ export function useDrawing(
     previewCtx = null
     strokeCanvas = null
     strokeCtx = null
+    inkComposeCanvas = null
+    inkComposeCtx = null
+    inkLiveAction = null
+    inkStream = null
+    inkTailPath = null
     dragCanvas = null
     dragCtx = null
     tempCanvas = null
