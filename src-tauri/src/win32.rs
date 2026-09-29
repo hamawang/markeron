@@ -82,11 +82,130 @@ pub fn raise_window_topmost_no_activate(hwnd: isize) {
 
 /// Move and resize a topmost window in one Win32 call so per-monitor DPI updates
 /// before the WebView relayouts (avoids pointer/canvas offset on mixed-DPI setups).
-pub fn position_window_on_monitor(hwnd: isize, x: i32, y: i32, width: u32, height: u32) {
+///
+/// By default the window stays 1px short of `height`: a topmost window that exactly
+/// covers a monitor is treated by Windows 11 as a fullscreen app, which strips the
+/// taskbar's Mica/transparency. `cover_monitor` drops that gap for sessions started
+/// over another fullscreen app, where a short window would make Explorer raise the
+/// taskbar above it once the overlay takes focus (#81).
+pub fn position_window_on_monitor(
+    hwnd: isize,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    cover_monitor: bool,
+) {
     let w = width.max(1) as i32;
-    let h = height.saturating_sub(1).max(1) as i32;
+    let h = if cover_monitor {
+        height
+    } else {
+        height.saturating_sub(1)
+    }
+    .max(1) as i32;
     unsafe {
         SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
+    }
+}
+
+/// Show a monitor-covering window without activating it, then re-fit it while visible.
+///
+/// Windows only re-evaluates whether a window is fullscreen when a visible window is
+/// resized; activation reuses that cached verdict. Sizing the overlay while hidden leaves
+/// it stale, so the first activation briefly raises the taskbar over a fullscreen app.
+pub fn show_covering_window_without_activation(hwnd: isize) {
+    use windows_sys::Win32::Foundation::{HWND, RECT as WinRect};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindowRect, ShowWindow, SWP_NOZORDER, SW_SHOWNA,
+    };
+
+    unsafe {
+        let mut rc: WinRect = std::mem::zeroed();
+        if GetWindowRect(hwnd as HWND, &mut rc) == 0 {
+            return;
+        }
+        let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+        ShowWindow(hwnd as HWND, SW_SHOWNA);
+        let flags = SWP_NOACTIVATE | SWP_NOZORDER;
+        SetWindowPos(hwnd, 0, rc.left, rc.top, w, (h - 1).max(1), flags);
+        SetWindowPos(hwnd, 0, rc.left, rc.top, w, h, flags);
+    }
+}
+
+fn rect_covers(
+    outer: &windows_sys::Win32::Foundation::RECT,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+) -> bool {
+    outer.left <= x
+        && outer.top <= y
+        && outer.right >= x + width as i32
+        && outer.bottom >= y + height as i32
+}
+
+/// Another process's foreground window if it fills the given monitor (browser F11,
+/// fullscreen video, slideshow). Desktop/taskbar, minimized and captioned windows do not
+/// count — a captioned maximized window can span the monitor when the taskbar auto-hides.
+/// Do not test `IsZoomed`: Chrome stays zoomed after F11 from a maximized window.
+pub fn fullscreen_foreground_window(x: i32, y: i32, width: u32, height: u32) -> Option<isize> {
+    use windows_sys::Win32::Foundation::{HWND, RECT as WinRect};
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetClassNameW, GetForegroundWindow, GetWindowLongW, GetWindowRect,
+        GetWindowThreadProcessId, IsIconic, GWL_STYLE, WS_CAPTION,
+    };
+
+    unsafe {
+        let hwnd: HWND = GetForegroundWindow();
+        if hwnd.is_null() {
+            return None;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        if pid == 0 || pid == GetCurrentProcessId() {
+            return None;
+        }
+        if IsIconic(hwnd) != 0 {
+            return None;
+        }
+        if (GetWindowLongW(hwnd, GWL_STYLE) as u32) & WS_CAPTION == WS_CAPTION {
+            return None;
+        }
+
+        let mut class = [0u16; 64];
+        let len = GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32);
+        if len > 0 {
+            let name = String::from_utf16_lossy(&class[..len as usize]);
+            if matches!(name.as_str(), "Progman" | "WorkerW") {
+                return None;
+            }
+        }
+
+        let mut rc: WinRect = std::mem::zeroed();
+        if GetWindowRect(hwnd, &mut rc) == 0 {
+            return None;
+        }
+        rect_covers(&rc, x, y, width, height).then_some(hwnd as isize)
+    }
+}
+
+/// Hand the foreground back to `hwnd`, but only while one of `holders` (overlay/toolbar)
+/// still has it — never steal focus from another app or from the settings window.
+/// No-op if `hwnd` is gone, hidden or minimized.
+pub fn restore_foreground_window(hwnd: isize, holders: &[isize]) -> bool {
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, IsIconic, IsWindowVisible, SetForegroundWindow,
+    };
+
+    let hwnd = hwnd as HWND;
+    unsafe {
+        holders.contains(&(GetForegroundWindow() as isize))
+            && IsWindowVisible(hwnd) != 0
+            && IsIconic(hwnd) == 0
+            && SetForegroundWindow(hwnd) != 0
     }
 }
 
@@ -251,5 +370,48 @@ pub fn destroy_hicon(handle: *mut std::ffi::c_void) {
         unsafe {
             windows_sys::Win32::UI::WindowsAndMessaging::DestroyIcon(handle);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rect_covers;
+    use windows_sys::Win32::Foundation::RECT;
+
+    #[test]
+    fn rect_covers_requires_the_full_monitor() {
+        let full = RECT {
+            left: 0,
+            top: 0,
+            right: 2560,
+            bottom: 1440,
+        };
+        let overhang = RECT {
+            left: -8,
+            top: -8,
+            right: 2568,
+            bottom: 1448,
+        };
+        let work_area = RECT {
+            left: -8,
+            top: -8,
+            right: 2568,
+            bottom: 1400,
+        };
+        assert!(rect_covers(&full, 0, 0, 2560, 1440));
+        assert!(rect_covers(&overhang, 0, 0, 2560, 1440));
+        assert!(!rect_covers(&work_area, 0, 0, 2560, 1440));
+    }
+
+    #[test]
+    fn rect_covers_is_per_monitor() {
+        let left_screen_fullscreen = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        assert!(rect_covers(&left_screen_fullscreen, 0, 0, 1920, 1080));
+        assert!(!rect_covers(&left_screen_fullscreen, 1920, 0, 2560, 1440));
     }
 }

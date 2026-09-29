@@ -4,7 +4,13 @@ use tracing::{info, warn};
 use crate::config::{lock_or_recover, AppState, ToolbarVisibility};
 use crate::diagnostics::log_backend_event;
 use crate::monitor;
+#[cfg(windows)]
+use std::sync::atomic::{AtomicIsize, Ordering};
 use std::time::{Duration, Instant};
+
+/// HWND of the fullscreen app the current drawing session covers (0 = none).
+#[cfg(windows)]
+static COVERED_FULLSCREEN_APP: AtomicIsize = AtomicIsize::new(0);
 
 fn set_ignore_cursor_events(window: &WebviewWindow, ignore: bool) {
     window.set_ignore_cursor_events(ignore).ok();
@@ -143,6 +149,8 @@ pub fn notify_overlay_geometry_changed(app: &AppHandle) {
 }
 
 pub fn setup_overlay_size(app: &AppHandle) {
+    #[cfg(windows)]
+    COVERED_FULLSCREEN_APP.store(0, Ordering::Relaxed);
     #[cfg(target_os = "macos")]
     {
         // Detach before moving the overlay so an attached toolbar is not dragged
@@ -162,7 +170,22 @@ pub fn setup_overlay_size(app: &AppHandle) {
             #[cfg(windows)]
             {
                 if let Ok(hwnd) = window.hwnd() {
-                    crate::win32::position_window_on_monitor(hwnd.0 as isize, x, y, w, h);
+                    // Sampled before the overlay is shown/focused, so this sees the app
+                    // the user invoked the shortcut from.
+                    let fullscreen_app = crate::win32::fullscreen_foreground_window(x, y, w, h);
+                    COVERED_FULLSCREEN_APP.store(fullscreen_app.unwrap_or(0), Ordering::Relaxed);
+                    let cover_monitor = fullscreen_app.is_some();
+                    if cover_monitor {
+                        info!("Overlay covering monitor: foreground app is fullscreen");
+                    }
+                    crate::win32::position_window_on_monitor(
+                        hwnd.0 as isize,
+                        x,
+                        y,
+                        w,
+                        h,
+                        cover_monitor,
+                    );
                 } else {
                     window
                         .set_size(tauri::PhysicalSize::new(w, h.saturating_sub(1)))
@@ -501,6 +524,7 @@ pub fn position_toolbar_at(
                 phys_y,
                 phys_w.max(1),
                 phys_h.max(96),
+                false,
             );
         } else {
             window
@@ -569,6 +593,22 @@ pub fn deactivate_drawing(app: &AppHandle, state: &AppState) {
     *lock_or_recover(&state.whiteboard_mode) = false;
 
     if let Some(window) = app.get_webview_window("overlay") {
+        // Hand focus back to the covered fullscreen app before hiding, and give Explorer a
+        // moment to register it; otherwise the taskbar briefly flashes above that app.
+        #[cfg(windows)]
+        {
+            let fullscreen_app = COVERED_FULLSCREEN_APP.swap(0, Ordering::Relaxed);
+            let toolbar = app.get_webview_window("toolbar");
+            let holders: Vec<isize> = std::iter::once(&window)
+                .chain(toolbar.as_ref())
+                .filter_map(|w| w.hwnd().ok().map(|h| h.0 as isize))
+                .collect();
+            if fullscreen_app != 0
+                && crate::win32::restore_foreground_window(fullscreen_app, &holders)
+            {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
         set_ignore_cursor_events(&window, true);
         window.hide().ok();
     }
@@ -590,8 +630,16 @@ pub fn activate_drawing(app: &AppHandle, state: &AppState) {
             }
         }
         ensure_overlay_transparent(&window);
-        window.show().ok();
+        // Drop click-through before `show()` activates the window: Explorer does not treat a
+        // WS_EX_TRANSPARENT foreground window as fullscreen and briefly raises the taskbar.
         set_ignore_cursor_events(&window, false);
+        #[cfg(windows)]
+        if COVERED_FULLSCREEN_APP.load(Ordering::Relaxed) != 0 {
+            if let Ok(hwnd) = window.hwnd() {
+                crate::win32::show_covering_window_without_activation(hwnd.0 as isize);
+            }
+        }
+        window.show().ok();
         window.set_always_on_top(true).ok();
         // Re-assert after show: some WebView2 builds only apply clear color once visible.
         ensure_overlay_transparent(&window);
