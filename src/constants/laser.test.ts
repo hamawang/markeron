@@ -2,9 +2,12 @@ import { describe, it, expect } from 'vitest'
 import {
   LASER_DECAY_LENGTH,
   LASER_DECAY_MS,
+  LASER_WRITING_FADE_MS,
+  LASER_WRITING_HOLD_MS,
   easeOut,
   isLaserTrailGone,
   laserSizeFromMapping,
+  laserWritingOpacity,
   pruneAgedLaserPoints,
   smoothLaserPositions,
 } from './laser'
@@ -78,5 +81,21 @@ describe('isLaserTrailGone', () => {
   it('is true only when every point has aged out', () => {
     expect(isLaserTrailGone([{ t: 0 }, { t: 100 }], LASER_DECAY_MS + 100)).toBe(true)
     expect(isLaserTrailGone([{ t: 0 }, { t: LASER_DECAY_MS - 1 }], LASER_DECAY_MS)).toBe(false)
+  })
+})
+
+describe('laserWritingOpacity', () => {
+  const releasedAt = 1000
+
+  it('stays fully opaque during the hold window', () => {
+    expect(laserWritingOpacity(releasedAt, releasedAt)).toBe(1)
+    expect(laserWritingOpacity(releasedAt + LASER_WRITING_HOLD_MS, releasedAt)).toBe(1)
+  })
+
+  it('fades linearly after the hold window and reaches 0', () => {
+    const mid = releasedAt + LASER_WRITING_HOLD_MS + LASER_WRITING_FADE_MS / 2
+    expect(laserWritingOpacity(mid, releasedAt)).toBeCloseTo(0.5)
+    expect(laserWritingOpacity(releasedAt + LASER_WRITING_HOLD_MS + LASER_WRITING_FADE_MS, releasedAt)).toBe(0)
+    expect(laserWritingOpacity(releasedAt + 10_000, releasedAt)).toBe(0)
   })
 })

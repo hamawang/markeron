@@ -146,6 +146,12 @@ export default {
     eraserModeObject: 'Object',
     eraserModeDesc:
       'Stroke: erase pixels along the drag path (undoable). Object: delete entire shapes or text when you pass over them (undoable). While the eraser is selected, press 7 again (or click the toolbar eraser again) to switch modes. Element dragging is disabled while the eraser is selected, even with hover drag on.',
+    laserMode: 'Laser pointer mode',
+    laserModeTrail: 'Trail',
+    laserModeWriting: 'Writing',
+    laserModeDescTrail: 'The laser trail fades like a comet tail right after you draw it — good for pointing.',
+    laserModeDescWriting:
+      'Laser strokes stay while you keep writing, even across short pauses between strokes. About 1 second after you stop, they fade out together — no eraser needed.',
     strokeSmoothing: 'Stroke smoothing',
     strokeSmoothingOff: 'Off',
     strokeSmoothingStandard: 'Standard',

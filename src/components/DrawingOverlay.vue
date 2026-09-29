@@ -66,6 +66,7 @@ import {
   resolveCssToLogicalRatio,
 } from '../utils/toolbarWindow'
 import { nextEraserMode, resolveEraserMode, type EraserMode } from '../utils/eraserMode'
+import { resolveLaserMode } from '../utils/laserMode'
 import { nextPenCursorStyle, resolvePenCursorStyle, type PenCursorStyle } from '../utils/penCursor'
 import {
   nextCrosshairCursorStyle,
@@ -321,6 +322,7 @@ const {
   setAngleSnapStep,
   eraserMode,
   setEraserMode,
+  setLaserMode,
   isDrawing,
   startDraw,
   draw,
@@ -473,6 +475,10 @@ function applyDefaultEntryFromConfig(general?: AppConfig['general']) {
 
 function applyEraserModeFromConfig(general?: AppConfig['general']) {
   setEraserMode(resolveEraserMode(general))
+}
+
+function applyLaserModeFromConfig(general?: AppConfig['general']) {
+  setLaserMode(resolveLaserMode(general))
 }
 
 function applyPenCursorStyleFromConfig(general?: AppConfig['general']) {
@@ -2054,6 +2060,7 @@ onMounted(async () => {
     applyToolbarFromConfig(cfg.general)
     applyDefaultEntryFromConfig(cfg.general)
     applyEraserModeFromConfig(cfg.general)
+    applyLaserModeFromConfig(cfg.general)
     applyPenCursorStyleFromConfig(cfg.general)
     applyCrosshairCursorStyleFromConfig(cfg.general)
     applyStrokeSmoothingFromConfig(cfg.general)
@@ -2075,6 +2082,7 @@ onMounted(async () => {
       applyToolbarFromConfig(event.payload.general)
       applyDefaultEntryFromConfig(event.payload.general)
       applyEraserModeFromConfig(event.payload.general)
+      applyLaserModeFromConfig(event.payload.general)
       applyPenCursorStyleFromConfig(event.payload.general)
       applyCrosshairCursorStyleFromConfig(event.payload.general)
       applyStrokeSmoothingFromConfig(event.payload.general)

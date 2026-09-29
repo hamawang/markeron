@@ -595,6 +595,39 @@ describe('useDrawing', () => {
         vi.useRealTimers()
       }
     })
+
+    it('writing mode keeps strokes through short pauses, then fades after hold', () => {
+      vi.useFakeTimers()
+      try {
+        drawing.setLaserMode('writing')
+        drawing.currentTool.value = 'laser'
+        drawing.startDraw({ x: 0, y: 0 })
+        drawing.draw({ x: 30, y: 30 })
+        drawing.endDraw()
+        expect(drawing.canClear.value).toBe(true)
+
+        // Past the trail lifetime but within hold + fade, strokes stay.
+        vi.advanceTimersByTime(1300)
+        expect(drawing.canClear.value).toBe(true)
+
+        // Cleared once hold + fade elapse.
+        vi.advanceTimersByTime(400)
+        expect(drawing.canClear.value).toBe(false)
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('switching laser mode clears existing strokes', () => {
+      drawing.currentTool.value = 'laser'
+      drawing.startDraw({ x: 0, y: 0 })
+      drawing.draw({ x: 20, y: 20 })
+      drawing.endDraw()
+      expect(drawing.canClear.value).toBe(true)
+
+      drawing.setLaserMode('writing')
+      expect(drawing.canClear.value).toBe(false)
+    })
   })
 
   describe('drag', () => {

@@ -9,6 +9,7 @@ import type { DefaultEntryMode } from '../../utils/entryMode'
 import { DEFAULT_ENTRY_MODE_OPTIONS } from '../../utils/entryMode'
 import type { EraserMode } from '../../utils/eraserMode'
 import { ERASER_MODE_OPTIONS } from '../../utils/eraserMode'
+import { LASER_MODE_OPTIONS, type LaserMode } from '../../utils/laserMode'
 import { STROKE_SMOOTHING_OPTIONS, type StrokeSmoothing } from '../../utils/strokeSmoothing'
 import { applyTheme, type ThemePreference } from '../../composables/useAppTheme'
 import { useI18n } from '../../i18n'
@@ -45,6 +46,7 @@ const themeOptions = ['dark', 'light', 'system'] as const
 const dragModeOptions = DRAG_MODE_OPTIONS
 const defaultEntryModeOptions = DEFAULT_ENTRY_MODE_OPTIONS
 const eraserModeOptions = ERASER_MODE_OPTIONS
+const laserModeOptions = LASER_MODE_OPTIONS
 const strokeSmoothingOptions = STROKE_SMOOTHING_OPTIONS
 const modKeyLabel = computed(() => (isMacOS() ? 'Command' : 'Ctrl'))
 
@@ -76,6 +78,7 @@ const props = defineProps<{
   dragMode: DragMode
   defaultEntryMode: DefaultEntryMode
   eraserMode: EraserMode
+  laserMode: LaserMode
   strokeSmoothing: StrokeSmoothing
   preserveDrawings: boolean
   whiteboardPreserveDrawings: boolean
@@ -88,6 +91,7 @@ const emit = defineEmits<{
   'update:dragMode': [value: DragMode]
   'update:defaultEntryMode': [value: DefaultEntryMode]
   'update:eraserMode': [value: EraserMode]
+  'update:laserMode': [value: LaserMode]
   'update:strokeSmoothing': [value: StrokeSmoothing]
   'update:preserveDrawings': [value: boolean]
   'update:whiteboardPreserveDrawings': [value: boolean]
@@ -227,6 +231,26 @@ async function setEraserMode(mode: EraserMode) {
     await invoke('save_general', { general: cfg.general })
   } catch (error) {
     console.error('Failed to save eraser mode:', error)
+  }
+}
+
+async function setLaserMode(mode: LaserMode) {
+  if (mode === props.laserMode) return
+  emit('update:laserMode', mode)
+  try {
+    const cfg = await invoke<AppConfig>('get_config')
+    if (!cfg.general)
+      cfg.general = {
+        dragMode: props.dragMode,
+        laserMode: mode,
+        preserveDrawings: false,
+        whiteboardPreserveDrawings: true,
+        angleSnapStep: props.angleSnapStep,
+      }
+    cfg.general.laserMode = mode
+    await invoke('save_general', { general: cfg.general })
+  } catch (error) {
+    console.error('Failed to save laser mode:', error)
   }
 }
 
@@ -549,6 +573,27 @@ async function commitAngleSnapStep(step: number) {
             </button>
           </div>
         </div>
+      </div>
+
+      <div class="settings-card">
+        <div class="settings-card-row">
+          <span class="settings-text-label">{{ t('settings.laserMode') }}</span>
+          <div class="flex items-center gap-1 shrink-0 flex-wrap justify-end max-w-[62%]">
+            <button
+              v-for="mode in laserModeOptions"
+              :key="mode"
+              class="px-2 py-1 rounded-md ui-segment leading-none transition-colors duration-120 whitespace-nowrap"
+              :class="{ 'ui-segment--active': laserMode === mode }"
+              :aria-pressed="laserMode === mode"
+              @click="setLaserMode(mode)"
+            >
+              {{ t(`settings.laserMode${mode === 'trail' ? 'Trail' : 'Writing'}`) }}
+            </button>
+          </div>
+        </div>
+        <p class="settings-card-desc">
+          {{ t(laserMode === 'trail' ? 'settings.laserModeDescTrail' : 'settings.laserModeDescWriting') }}
+        </p>
       </div>
 
       <div class="settings-card">

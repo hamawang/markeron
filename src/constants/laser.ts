@@ -82,6 +82,19 @@ export function pruneAgedLaserPoints<T extends { t?: number }>(points: T[], now:
   return start === 0 ? points : points.slice(start)
 }
 
+/** Writing mode: idle time after the last pen-up before strokes start fading. */
+export const LASER_WRITING_HOLD_MS = 1000
+
+/** Writing mode: duration of the shared fade-out once the hold elapses. */
+export const LASER_WRITING_FADE_MS = 400
+
+/** Writing-mode opacity for all resting strokes, from the time of the last pen-up. */
+export function laserWritingOpacity(now: number, releasedAt: number): number {
+  const faded = now - releasedAt - LASER_WRITING_HOLD_MS
+  if (faded <= 0) return 1
+  return Math.max(0, 1 - faded / LASER_WRITING_FADE_MS)
+}
+
 /** True once no points remain visible. */
 export function isLaserTrailGone(points: { t?: number }[], now: number): boolean {
   if (points.length === 0) return true

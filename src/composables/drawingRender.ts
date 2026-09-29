@@ -311,6 +311,7 @@ export function drawLaserTrail(
   lineWidth: number,
   now = performance.now(),
   keepHead = false,
+  uniform = false,
 ) {
   if (points.length === 0) return
 
@@ -323,7 +324,8 @@ export function drawLaserTrail(
     streamline: 0,
     simplify: 0,
     keepHead,
-    sizeMapping: (c) => laserSizeFromMapping(c, now),
+    // Writing mode keeps the whole stroke at full width until the shared fade-out.
+    sizeMapping: uniform ? () => 1 : (c) => laserSizeFromMapping(c, now),
   })
 
   const smoothed = smoothLaserPositions(points)

@@ -1,5 +1,6 @@
 import { ref, shallowRef, computed, type Ref } from 'vue'
 import type { EraserMode } from '../utils/eraserMode'
+import type { LaserMode } from '../utils/laserMode'
 import {
   computeBbox,
   computeTextBbox,
@@ -13,7 +14,7 @@ import {
 import { drawActionDirect, drawLaserTrail } from './drawingRender'
 import { normalizeTextOutline } from '../constants/textOutline'
 import { stampFontSizeFromWidth } from '../constants/stamp'
-import { isLaserTrailGone, pruneAgedLaserPoints } from '../constants/laser'
+import { LASER_WRITING_HOLD_MS, isLaserTrailGone, laserWritingOpacity, pruneAgedLaserPoints } from '../constants/laser'
 import {
   computeMinDistSq,
   getInkOutlineFromStrokePoints,
@@ -87,6 +88,7 @@ export function useDrawing(
   const isDrawing = ref(false)
   const angleSnapStep = ref(15)
   const eraserMode = ref<EraserMode>('stroke')
+  const laserMode = ref<LaserMode>('trail')
 
   /** Live ink buffer needs rebake (declared early for mid-gesture width sync). */
   let inkPreviewDirty = true
@@ -219,6 +221,13 @@ export function useDrawing(
   const laserStrokes: LaserStroke[] = []
   const laserRevision = ref(0)
   let laserRafId: number | null = null
+  /** Writing mode: `performance.now()` of the last laser pen-up; drives the shared fade. */
+  let laserReleasedAt = 0
+  /** Writing mode: finished strokes do not change until they fade, so they are baked once. */
+  let laserWritingCanvas: HTMLCanvasElement | null = null
+  let laserWritingCtx: CanvasRenderingContext2D | null = null
+  let laserWritingBaked = 0
+  let laserWritingDpr = 0
 
   const canUndo = computed(() => {
     void historyRevision.value
@@ -253,15 +262,42 @@ export function useDrawing(
     }
   }
 
+  function resetLaserWritingCache() {
+    laserWritingBaked = 0
+    if (laserWritingCtx && laserWritingCanvas) {
+      laserWritingCtx.setTransform(1, 0, 0, 1, 0, 0)
+      laserWritingCtx.clearRect(0, 0, laserWritingCanvas.width, laserWritingCanvas.height)
+    }
+  }
+
   function clearLaserStrokes(): boolean {
     if (laserStrokes.length === 0) return false
     laserStrokes.length = 0
+    resetLaserWritingCache()
     markLaserChanged()
     stopLaserAnimation()
     return true
   }
 
+  function setLaserMode(mode: LaserMode) {
+    if (laserMode.value === mode) return
+    laserMode.value = mode
+    if (clearLaserStrokes()) {
+      previewDirty = true
+      scheduleRender()
+    }
+  }
+
   function pruneExpiredLaserStrokes(now: number): boolean {
+    if (laserMode.value === 'writing') {
+      if (isDrawingLaser() || laserStrokes.length === 0) return false
+      if (laserWritingOpacity(now, laserReleasedAt) > 0) return false
+      laserStrokes.length = 0
+      resetLaserWritingCache()
+      markLaserChanged()
+      return true
+    }
+
     let removed = false
     for (let i = laserStrokes.length - 1; i >= 0; i--) {
       const stroke = laserStrokes[i]
@@ -298,9 +334,13 @@ export function useDrawing(
     const tick = () => {
       laserRafId = null
       const now = performance.now()
-      pruneExpiredLaserStrokes(now)
-      previewDirty = true
-      scheduleRender()
+      const removed = pruneExpiredLaserStrokes(now)
+      // Resting writing-mode strokes are static until the fade starts; skip redundant repaints.
+      const idle = laserMode.value === 'writing' && !isDrawingLaser() && laserWritingOpacity(now, laserReleasedAt) >= 1
+      if (removed || !idle) {
+        previewDirty = true
+        scheduleRender()
+      }
       if (needsLaserAnimation()) {
         laserRafId = window.setTimeout(tick, 16)
       }
@@ -308,7 +348,47 @@ export function useDrawing(
     laserRafId = window.setTimeout(tick, 16)
   }
 
+  /** Bake finished writing-mode strokes into a canvas matching `target` (device pixels). */
+  function syncLaserWritingCache(target: HTMLCanvasElement, dpr: number): HTMLCanvasElement | null {
+    if (
+      !laserWritingCanvas ||
+      laserWritingCanvas.width !== target.width ||
+      laserWritingCanvas.height !== target.height ||
+      laserWritingDpr !== dpr
+    ) {
+      laserWritingCanvas ??= document.createElement('canvas')
+      laserWritingCanvas.width = target.width
+      laserWritingCanvas.height = target.height
+      laserWritingCtx = laserWritingCanvas.getContext('2d')
+      laserWritingDpr = dpr
+      laserWritingBaked = 0
+    }
+    const ctx = laserWritingCtx
+    if (!ctx) return null
+    if (laserWritingBaked > laserStrokes.length) resetLaserWritingCache()
+    if (laserWritingBaked < laserStrokes.length) {
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+      for (let i = laserWritingBaked; i < laserStrokes.length; i++) {
+        const { action } = laserStrokes[i]
+        drawLaserTrail(ctx, action.points, action.color, action.lineWidth, 0, false, true)
+      }
+      laserWritingBaked = laserStrokes.length
+    }
+    return laserWritingCanvas
+  }
+
   function drawLaserStrokes(ctx: CanvasRenderingContext2D, now = performance.now()) {
+    if (laserMode.value === 'writing') {
+      const opacity = isDrawingLaser() ? 1 : laserWritingOpacity(now, laserReleasedAt)
+      const cache = opacity > 0 ? syncLaserWritingCache(ctx.canvas, getEffectiveDpr()) : null
+      if (!cache) return
+      ctx.save()
+      ctx.setTransform(1, 0, 0, 1, 0, 0)
+      ctx.globalAlpha = opacity
+      ctx.drawImage(cache, 0, 0)
+      ctx.restore()
+      return
+    }
     for (let i = 0; i < laserStrokes.length; i++) {
       const { action } = laserStrokes[i]
       drawLaserTrail(ctx, action.points, action.color, action.lineWidth, now, false)
@@ -937,7 +1017,15 @@ export function useDrawing(
     if (action && action.tool !== 'eraser') {
       if (action.tool === 'laser') {
         ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
-        drawLaserTrail(ctx, action.points, action.color, action.lineWidth, performance.now(), true)
+        drawLaserTrail(
+          ctx,
+          action.points,
+          action.color,
+          action.lineWidth,
+          performance.now(),
+          true,
+          laserMode.value === 'writing',
+        )
       } else if (isInkTool(action.tool) && strokeCanvas) {
         if (inkPreviewDirty) bakeIncrementalStroke(action)
         drawLiveInk(ctx, action, dpr)
@@ -1121,6 +1209,14 @@ export function useDrawing(
       bakeIncrementalStroke(currentAction.value)
     }
     if (currentTool.value === 'laser') {
+      // A stroke started after the hold window begins a new passage; drop the fading one.
+      if (
+        laserMode.value === 'writing' &&
+        laserStrokes.length > 0 &&
+        performance.now() - laserReleasedAt > LASER_WRITING_HOLD_MS
+      ) {
+        clearLaserStrokes()
+      }
       ensureLaserAnimation()
     }
     if (currentTool.value === 'eraser') {
@@ -1237,6 +1333,7 @@ export function useDrawing(
 
     if (action.tool === 'laser') {
       laserStrokes.push({ action })
+      laserReleasedAt = performance.now()
       markLaserChanged()
       currentAction.value = null
       previewDirty = true
@@ -1308,6 +1405,7 @@ export function useDrawing(
 
   function cancelDraw() {
     if (!isDrawing.value) return
+    if (currentAction.value?.tool === 'laser') laserReleasedAt = performance.now()
     isDrawing.value = false
     currentAction.value = null
     clearStrokeCanvas()
@@ -1828,6 +1926,9 @@ export function useDrawing(
     }
     stopLaserAnimation()
     laserStrokes.length = 0
+    laserWritingCanvas = null
+    laserWritingCtx = null
+    laserWritingBaked = 0
     cacheCanvas = null
     cacheCtx = null
     cacheAppliedDpr = 0
@@ -1859,6 +1960,8 @@ export function useDrawing(
     angleSnapStep,
     eraserMode,
     setEraserMode,
+    laserMode,
+    setLaserMode,
     isDrawing,
     /** Active stroke width (for tests / diagnostics); null when not drawing. */
     getActiveStrokeLineWidth: () => currentAction.value?.lineWidth ?? null,

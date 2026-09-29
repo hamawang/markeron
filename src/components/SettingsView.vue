@@ -7,6 +7,7 @@ import { resolveDragMode, type DragMode } from '../utils/dragMode'
 import { applyTheme, watchSystemTheme, type ThemePreference } from '../composables/useAppTheme'
 import { resolveDefaultEntryMode, type DefaultEntryMode } from '../utils/entryMode'
 import { resolveEraserMode, type EraserMode } from '../utils/eraserMode'
+import { resolveLaserMode, type LaserMode } from '../utils/laserMode'
 import { resolveStrokeSmoothing, type StrokeSmoothing } from '../utils/strokeSmoothing'
 import { isEnabled } from '@tauri-apps/plugin-autostart'
 import { reconcileAutoStartState, resolveAutoStart } from '../utils/autoStart'
@@ -218,6 +219,7 @@ const theme = ref<ThemePreference>('dark')
 const dragMode = ref<DragMode>('off')
 const defaultEntryMode = ref<DefaultEntryMode>('screen')
 const eraserMode = ref<EraserMode>('stroke')
+const laserMode = ref<LaserMode>('trail')
 const strokeSmoothing = ref<StrokeSmoothing>('standard')
 const preserveDrawings = ref(false)
 const whiteboardPreserveDrawings = ref(true)
@@ -253,6 +255,7 @@ onMounted(async () => {
   dragMode.value = resolveDragMode(cfg.general)
   defaultEntryMode.value = resolveDefaultEntryMode(cfg.general)
   eraserMode.value = resolveEraserMode(cfg.general)
+  laserMode.value = resolveLaserMode(cfg.general)
   strokeSmoothing.value = resolveStrokeSmoothing(cfg.general)
   preserveDrawings.value = cfg.general?.preserveDrawings ?? false
   whiteboardPreserveDrawings.value = cfg.general?.whiteboardPreserveDrawings ?? true
@@ -274,6 +277,7 @@ onMounted(async () => {
     dragMode.value = resolveDragMode(general)
     defaultEntryMode.value = resolveDefaultEntryMode(general)
     eraserMode.value = resolveEraserMode(general)
+    laserMode.value = resolveLaserMode(general)
     strokeSmoothing.value = resolveStrokeSmoothing(general)
     preserveDrawings.value = general?.preserveDrawings ?? false
     whiteboardPreserveDrawings.value = general?.whiteboardPreserveDrawings ?? true
@@ -514,6 +518,7 @@ onUnmounted(() => {
         :drag-mode="dragMode"
         :default-entry-mode="defaultEntryMode"
         :eraser-mode="eraserMode"
+        :laser-mode="laserMode"
         :stroke-smoothing="strokeSmoothing"
         :preserve-drawings="preserveDrawings"
         :whiteboard-preserve-drawings="whiteboardPreserveDrawings"
@@ -523,6 +528,7 @@ onUnmounted(() => {
         @update:drag-mode="dragMode = $event"
         @update:default-entry-mode="defaultEntryMode = $event"
         @update:eraser-mode="eraserMode = $event"
+        @update:laser-mode="laserMode = $event"
         @update:stroke-smoothing="strokeSmoothing = $event"
         @update:preserve-drawings="preserveDrawings = $event"
         @update:whiteboard-preserve-drawings="whiteboardPreserveDrawings = $event"

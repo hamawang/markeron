@@ -116,6 +116,15 @@ pub enum EraserMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum LaserMode {
+    #[serde(rename = "trail")]
+    #[default]
+    Trail,
+    #[serde(rename = "writing")]
+    Writing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum PenCursorStyle {
     #[serde(rename = "pen")]
     #[default]
@@ -184,6 +193,8 @@ pub struct GeneralConfig {
     pub default_entry_mode: DefaultEntryMode,
     #[serde(default, rename = "eraserMode")]
     pub eraser_mode: EraserMode,
+    #[serde(default, rename = "laserMode")]
+    pub laser_mode: LaserMode,
     #[serde(default, rename = "penCursorStyle")]
     pub pen_cursor_style: PenCursorStyle,
     #[serde(default, rename = "crosshairCursorStyle")]
@@ -211,6 +222,7 @@ impl Default for GeneralConfig {
             toolbar_visibility: ToolbarVisibility::Space,
             default_entry_mode: DefaultEntryMode::Screen,
             eraser_mode: EraserMode::Stroke,
+            laser_mode: LaserMode::Trail,
             pen_cursor_style: PenCursorStyle::Pen,
             crosshair_cursor_style: CrosshairCursorStyle::Crosshair,
             stroke_smoothing: StrokeSmoothing::Standard,
@@ -779,6 +791,29 @@ mod tests {
     fn general_config_defaults_eraser_mode() {
         let general = GeneralConfig::default();
         assert_eq!(general.eraser_mode, EraserMode::Stroke);
+    }
+
+    #[test]
+    fn config_deserializes_laser_mode() {
+        let json = r#"{
+            "shortcuts": {
+                "toggleDrawing": "Ctrl+Shift+D",
+                "clearDrawing": "Ctrl+Shift+C"
+            },
+            "general": {
+                "laserMode": "writing"
+            }
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.general.laser_mode, LaserMode::Writing);
+    }
+
+    #[test]
+    fn general_config_defaults_laser_mode() {
+        let general = GeneralConfig::default();
+        assert_eq!(general.laser_mode, LaserMode::Trail);
+        let json = serde_json::to_value(&general).unwrap();
+        assert_eq!(json["laserMode"], "trail");
     }
 
     #[test]

@@ -143,6 +143,11 @@ export default {
     eraserModeObject: '对象擦除',
     eraserModeDesc:
       '轨迹擦除：按路径局部擦除像素（可撤销）。对象擦除：划过图形或文字时删除整个元素（可撤销）。标注中选中橡皮擦后再按 7（或再点工具栏橡皮擦）可切换模式。使用橡皮擦时不会触发元素拖拽，即使已开启悬停拖动。',
+    laserMode: '激光笔模式',
+    laserModeTrail: '拖尾',
+    laserModeWriting: '书写',
+    laserModeDescTrail: '笔迹画出后像彗星拖尾一样很快淡出，适合指示和圈画重点。',
+    laserModeDescWriting: '连续书写时笔迹一直保留，笔画之间短暂停顿也不会消失；停笔约 1 秒后全部一起淡出，无需橡皮擦。',
     strokeSmoothing: '笔迹平滑',
     strokeSmoothingOff: '关闭',
     strokeSmoothingStandard: '标准',
