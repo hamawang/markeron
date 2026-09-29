@@ -59,7 +59,12 @@ import { resolveDefaultEntryMode, shouldClearWhiteboardOnEntry, type DefaultEntr
 import { logDiagnostic, logSessionEvent, logActionEvent } from '../utils/diagnosticEvents'
 import type { MonitorLogicalBounds } from '../utils/toolbarPosition'
 import { toolbarPopupScreenPosition } from '../utils/toolbarPosition'
-import { TOOLBAR_PANEL_WIDTH, getToolbarPanelHeight, rememberToolbarPanelHeight } from '../utils/toolbarWindow'
+import {
+  TOOLBAR_PANEL_WIDTH,
+  getToolbarPanelHeight,
+  rememberToolbarPanelHeight,
+  resolveCssToLogicalRatio,
+} from '../utils/toolbarWindow'
 import { nextEraserMode, resolveEraserMode, type EraserMode } from '../utils/eraserMode'
 import { nextPenCursorStyle, resolvePenCursorStyle, type PenCursorStyle } from '../utils/penCursor'
 import {
@@ -389,21 +394,23 @@ async function openToolbarPopupAtPointer(): Promise<void> {
   await ensureOverlayLayoutReady()
   await seedPointerPosition()
 
-  const panelW = TOOLBAR_PANEL_WIDTH
-  const panelH = getToolbarPanelHeight()
+  // Overlay client coords and the toolbar panel size are CSS px; placement is Tauri logical px.
+  const cssToLogical = await resolveCssToLogicalRatio()
+  const panelW = TOOLBAR_PANEL_WIDTH * cssToLogical
+  const panelH = getToolbarPanelHeight() * cssToLogical
+  const pointerX = lastPointerX * cssToLogical
+  const pointerY = lastPointerY * cssToLogical
   let monitorBounds: MonitorLogicalBounds | null = null
   try {
     monitorBounds = await invoke<MonitorLogicalBounds | null>('get_overlay_monitor_logical_bounds')
   } catch {
     // non-fatal for positioning; still log client-side coords
   }
-  const { left, top } = toolbarPopupScreenPosition(lastPointerX, lastPointerY, panelW, panelH, monitorBounds, {
-    width: window.innerWidth,
-    height: window.innerHeight,
+  const { left, top } = toolbarPopupScreenPosition(pointerX, pointerY, panelW, panelH, monitorBounds, {
+    width: window.innerWidth * cssToLogical,
+    height: window.innerHeight * cssToLogical,
   })
-  const anchorScreen = monitorBounds
-    ? { x: monitorBounds.left + lastPointerX, y: monitorBounds.top + lastPointerY }
-    : null
+  const anchorScreen = monitorBounds ? { x: monitorBounds.left + pointerX, y: monitorBounds.top + pointerY } : null
   logActionEvent('toolbar popup opened', {
     pointerClient: { x: lastPointerX, y: lastPointerY },
     pointerScreen: pointerScreenKnown ? { x: lastScreenX, y: lastScreenY } : null,
@@ -412,8 +419,9 @@ async function openToolbarPopupAtPointer(): Promise<void> {
     overlayViewport: { width: window.innerWidth, height: window.innerHeight },
     monitorBounds,
     devicePixelRatio: window.devicePixelRatio,
+    cssToLogical,
   })
-  await invoke('set_toolbar_popup', { visible: true, x: left, y: top, height: panelH })
+  await invoke('set_toolbar_popup', { visible: true, x: left, y: top, width: panelW, height: panelH })
 }
 
 async function setToolbarPopupVisible(visible: boolean) {
@@ -720,12 +728,16 @@ async function seedPointerPosition() {
       screenY: number
     } | null>('get_overlay_pointer_position')
     if (!pos) return
-    lastPointerX = pos.x
-    lastPointerY = pos.y
+    // Backend reports Tauri logical px; overlay client coords are CSS px.
+    const cssToLogical = await resolveCssToLogicalRatio()
+    const x = pos.x / cssToLogical
+    const y = pos.y / cssToLogical
+    lastPointerX = x
+    lastPointerY = y
     lastScreenX = pos.screenX
     lastScreenY = pos.screenY
     pointerScreenKnown = true
-    mousePos.value = { x: pos.x, y: pos.y }
+    mousePos.value = { x, y }
   } catch (error) {
     console.error('Failed to seed pointer position:', error)
   }

@@ -21,6 +21,8 @@ import {
   refreshToolbarWindowScreenOrigin,
   repositionToolbarAfterHeightChange,
   getToolbarPanelHeight,
+  getCachedCssToLogicalRatio,
+  resolveCssToLogicalRatio,
   TOOLBAR_PANEL_WIDTH,
 } from '../utils/toolbarWindow'
 import type { MonitorLogicalBounds } from '../utils/toolbarPosition'
@@ -147,7 +149,7 @@ async function syncStandaloneWindowSize() {
   await nextTick()
   if (generation !== syncSizeGeneration || !panelRef.value) return
   const width = panelW.value
-  let oldHeight = getToolbarPanelHeight()
+  let oldHeight = getToolbarPanelHeight() * getCachedCssToLogicalRatio()
   try {
     const win = getCurrentWindow()
     const [size, scale] = await Promise.all([win.outerSize(), win.scaleFactor()])
@@ -158,7 +160,8 @@ async function syncStandaloneWindowSize() {
   }
   const height = measureToolbarPanelHeight(panelRef.value)
   await fitToolbarWindow(width, height)
-  await repositionToolbarAfterHeightChange(oldHeight, height, { persist: props.pinned })
+  const newHeight = height * getCachedCssToLogicalRatio()
+  await repositionToolbarAfterHeightChange(oldHeight, newHeight, { persist: props.pinned })
   if (isMacOS()) {
     await refreshToolbarWindowScreenOrigin()
   }
@@ -184,6 +187,31 @@ function probePanelHoverAtScreen(screenX: number, screenY: number) {
   const r = panelRef.value.getBoundingClientRect()
   const origin = getToolbarWindowScreenOrigin()
   emitPanelHover(isPointerOverPanelRect(screenX, screenY, origin.x, origin.y, r))
+}
+
+let dprMediaQuery: MediaQueryList | null = null
+
+function unwatchDevicePixelRatio() {
+  dprMediaQuery?.removeEventListener('change', onDevicePixelRatioChange)
+  dprMediaQuery = null
+}
+
+function watchDevicePixelRatio() {
+  unwatchDevicePixelRatio()
+  dprMediaQuery = window.matchMedia(`(resolution: ${window.devicePixelRatio || 1}dppx)`)
+  dprMediaQuery.addEventListener('change', onDevicePixelRatioChange)
+}
+
+/**
+ * Windows "Text size" changes DPR without resizing the panel's CSS box, so the
+ * ResizeObserver never fires. Monitor DPI moves keep the ratio and are left to the OS.
+ */
+function onDevicePixelRatioChange() {
+  watchDevicePixelRatio()
+  const previous = getCachedCssToLogicalRatio()
+  void resolveCssToLogicalRatio().then((ratio) => {
+    if (ratio !== previous) scheduleSyncStandaloneWindowSize()
+  })
 }
 
 function scheduleSyncStandaloneWindowSize() {
@@ -254,12 +282,15 @@ let dragPointerId: number | null = null
 let captureTarget: HTMLElement | null = null
 let windowDragOffset = { x: 0, y: 0 }
 let dragMonitorBounds: MonitorLogicalBounds | null = null
+let dragCssToLogical = 1
 
+/** Inputs are CSS px (screen coords / panel height); output is Tauri logical px. */
 function clampStandaloneWindowPosition(left: number, top: number, panelH: number) {
+  const r = dragCssToLogical
   if (!dragMonitorBounds) {
-    return { left, top }
+    return { left: left * r, top: top * r }
   }
-  return clampToolbarWindowPosition(left, top, panelW.value, panelH, dragMonitorBounds)
+  return clampToolbarWindowPosition(left * r, top * r, panelW.value * r, panelH * r, dragMonitorBounds)
 }
 
 function scheduleDragUpdate() {
@@ -307,8 +338,12 @@ function startDrag(e: PointerEvent) {
   if (props.standaloneWindow) {
     windowDragOffset = { x: e.clientX, y: e.clientY }
     dragMonitorBounds = null
+    dragCssToLogical = getCachedCssToLogicalRatio()
     void fetchOverlayMonitorBounds().then((bounds) => {
       dragMonitorBounds = bounds
+    })
+    void resolveCssToLogicalRatio().then((ratio) => {
+      dragCssToLogical = ratio
     })
     return
   }
@@ -417,6 +452,7 @@ onMounted(() => {
       if (panelRef.value) panelResizeObserver?.observe(panelRef.value)
     })
   }
+  if (props.standaloneWindow) watchDevicePixelRatio()
 })
 
 onUnmounted(() => {
@@ -427,6 +463,7 @@ onUnmounted(() => {
   }
   panelResizeObserver?.disconnect()
   panelResizeObserver = null
+  unwatchDevicePixelRatio()
   emitPanelHover(false)
   window.removeEventListener('pointermove', onPointerMove)
   window.removeEventListener('pointerup', stopDrag)

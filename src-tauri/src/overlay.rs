@@ -237,6 +237,18 @@ fn toolbar_panel_height_logical(window: &tauri::WebviewWindow, fallback: f64) ->
         .unwrap_or(fallback)
 }
 
+/// Current toolbar window width. The frontend sizes it to the panel's CSS width times the
+/// Windows text-scale factor, so this can exceed `TOOLBAR_PANEL_WIDTH`.
+fn toolbar_panel_width_logical(window: &tauri::WebviewWindow) -> f64 {
+    let scale = window.scale_factor().unwrap_or(1.0);
+    window
+        .outer_size()
+        .ok()
+        .map(|s| s.width as f64 / scale)
+        .filter(|w| *w >= 64.0)
+        .unwrap_or(TOOLBAR_PANEL_WIDTH)
+}
+
 fn position_toolbar_window(app: &AppHandle) {
     let Some(window) = app.get_webview_window("toolbar") else {
         return;
@@ -274,7 +286,7 @@ fn create_toolbar_window(app: &AppHandle) {
     let url = WebviewUrl::App("index.html#toolbar".into());
     let builder = WebviewWindowBuilder::new(app, "toolbar", url)
         .title("MarkerOn")
-        .inner_size(TOOLBAR_WIDTH, TOOLBAR_PANEL_HEIGHT_COMPACT)
+        .inner_size(TOOLBAR_PANEL_WIDTH, TOOLBAR_PANEL_HEIGHT_COMPACT)
         .decorations(false)
         .transparent(true)
         .always_on_top(true)
@@ -372,11 +384,12 @@ fn clamp_toolbar_to_overlay_monitor(app: &AppHandle) {
     let left = pos.x as f64 / toolbar_scale;
     let top = pos.y as f64 / toolbar_scale;
 
+    let panel_w = toolbar_panel_width_logical(&window);
     let panel_h = toolbar_panel_height_logical(&window, TOOLBAR_PANEL_HEIGHT_COMPACT);
     let (x, y) = monitor::clamp_logical_position_to_monitor(
         left,
         top,
-        TOOLBAR_PANEL_WIDTH,
+        panel_w,
         panel_h,
         &bounds,
         TOOLBAR_EDGE_MARGIN,
@@ -422,7 +435,13 @@ pub fn set_toolbar_window_visible(app: &AppHandle, visible: bool) {
     }
 }
 
-pub fn position_toolbar_at(app: &AppHandle, x: f64, y: f64, panel_height: Option<f64>) {
+pub fn position_toolbar_at(
+    app: &AppHandle,
+    x: f64,
+    y: f64,
+    panel_width: Option<f64>,
+    panel_height: Option<f64>,
+) {
     create_toolbar_window(app);
     let Some(window) = app.get_webview_window("toolbar") else {
         return;
@@ -430,6 +449,9 @@ pub fn position_toolbar_at(app: &AppHandle, x: f64, y: f64, panel_height: Option
     let bounds = monitor::get_overlay_monitor_logical_bounds(app);
     let requested_x = x;
     let requested_y = y;
+    let panel_w = panel_width
+        .filter(|w| *w >= 64.0)
+        .unwrap_or(TOOLBAR_PANEL_WIDTH);
     let panel_h = panel_height
         .filter(|h| *h >= 64.0)
         .unwrap_or_else(|| toolbar_panel_height_logical(&window, TOOLBAR_PANEL_HEIGHT_COMPACT));
@@ -437,7 +459,7 @@ pub fn position_toolbar_at(app: &AppHandle, x: f64, y: f64, panel_height: Option
         monitor::clamp_logical_position_to_monitor(
             x,
             y,
-            TOOLBAR_PANEL_WIDTH,
+            panel_w,
             panel_h,
             bounds,
             TOOLBAR_EDGE_MARGIN,
@@ -458,6 +480,7 @@ pub fn position_toolbar_at(app: &AppHandle, x: f64, y: f64, panel_height: Option
         Some(serde_json::json!({
             "requested": { "x": requested_x, "y": requested_y },
             "clamped": { "x": x, "y": y },
+            "panelWidth": panel_w,
             "panelHeight": panel_h,
             "monitorBounds": bounds,
             "overlayScale": overlay_scale,
@@ -469,7 +492,7 @@ pub fn position_toolbar_at(app: &AppHandle, x: f64, y: f64, panel_height: Option
     {
         let phys_x = (x * overlay_scale).round() as i32;
         let phys_y = (y * overlay_scale).round() as i32;
-        let phys_w = (TOOLBAR_PANEL_WIDTH * overlay_scale).round() as u32;
+        let phys_w = (panel_w * overlay_scale).round() as u32;
         let phys_h = (panel_h * overlay_scale).round() as u32;
         if let Ok(hwnd) = window.hwnd() {
             crate::win32::position_window_on_monitor(
@@ -512,11 +535,12 @@ pub fn set_toolbar_popup(
     visible: bool,
     x: Option<f64>,
     y: Option<f64>,
+    width: Option<f64>,
     height: Option<f64>,
 ) {
     if visible {
         if let (Some(x), Some(y)) = (x, y) {
-            position_toolbar_at(app, x, y, height);
+            position_toolbar_at(app, x, y, width, height);
         }
         set_toolbar_window_visible(app, true);
         suppress_penetration_for(state, 800);

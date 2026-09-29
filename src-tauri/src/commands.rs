@@ -275,9 +275,10 @@ pub fn set_toolbar_popup(
     visible: bool,
     x: Option<f64>,
     y: Option<f64>,
+    width: Option<f64>,
     height: Option<f64>,
 ) {
-    crate::overlay::set_toolbar_popup(&app, &state, visible, x, y, height);
+    crate::overlay::set_toolbar_popup(&app, &state, visible, x, y, width, height);
 }
 
 #[tauri::command]
